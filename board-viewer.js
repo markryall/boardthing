@@ -87,13 +87,21 @@ function readBoard() {
 function readCard(col, filename) {
   const resolved = path.resolve(path.join(BOARD_DIR, col, filename))
   if (!resolved.startsWith(BOARD_DIR + path.sep)) return null
-  try { return fs.readFileSync(resolved, 'utf8') } catch { return null }
+  try {
+    const content = fs.readFileSync(resolved, 'utf8')
+    boardLog('read ' + resolved)
+    return content
+  } catch { return null }
 }
 
 function writeCard(col, filename, content) {
   const resolved = path.resolve(path.join(BOARD_DIR, col, filename))
   if (!resolved.startsWith(BOARD_DIR + path.sep)) return false
-  try { fs.writeFileSync(resolved, content); return true } catch { return false }
+  try {
+    fs.writeFileSync(resolved, content)
+    boardLog('write ' + resolved)
+    return true
+  } catch { return false }
 }
 
 function createCard(colId, name, brief) {
@@ -104,32 +112,60 @@ function createCard(colId, name, brief) {
   if (!resolved.startsWith(BOARD_DIR + path.sep)) return null
   fs.mkdirSync(colPath, { recursive: true })
   fs.writeFileSync(resolved, '# Brief\n\n' + brief.trim() + '\n')
+  boardLog('write ' + resolved)
   return filename
 }
+
+// ── Logging ──────────────────────────────────────────────────────────────────
+
+function isoTimestampLocal() {
+  const d = new Date()
+  const pad = n => String(n).padStart(2, '0')
+  const offset = -d.getTimezoneOffset()
+  const sign = offset >= 0 ? '+' : '-'
+  const abs = Math.abs(offset)
+  const oh = pad(Math.floor(abs / 60))
+  const om = pad(abs % 60)
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+    'T' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()) +
+    sign + oh + ':' + om
+}
+
+function boardLog(message) {
+  process.stdout.write(isoTimestampLocal() + ' [boardthing] ' + message + '\n')
+}
+
+// TODO: Spec criterion 6 (log "rename" when an agent renames a card file, e.g. .md → .md.wip
+// and back) cannot be fulfilled here because agent subprocesses rename card files directly via
+// their own file-system access; board-viewer.js has no rename API endpoint. A future card should
+// either add a rename API or use filesystem event detection to observe these renames.
 
 // ── Watchers ─────────────────────────────────────────────────────────────────
 
 const watchers = {}
+// watchers[colId] = {
+//   fsWatcher:   FSWatcher | null   — null when poolSize == 0
+//   debounce:    Timeout | null
+//   poolSize:    number             — configured target concurrent agents
+//   activeCount: number             — agents currently running
+//   processes:   ChildProcess[]     — running agent processes
+//   transition:  object
+//   spawnOne:    function           — bound spawner for this column
+// }
 
-function startWatcher(fromColId) {
-  if (watchers[fromColId]) return false
-  const transition = transitionFrom(fromColId)
-  if (!transition || !transition.agentPath) return false
-
+// Build the spawnOne closure for a column. Called once per column entry.
+function makeSpawnOne(fromColId, transition) {
   const fromPath = path.join(BOARD_DIR, fromColId)
   const toPath   = path.join(BOARD_DIR, transition.to)
-  try { fs.mkdirSync(fromPath, { recursive: true }) } catch {}
 
-  const { repo } = loadConfig()
-
-  function runAgent() {
-    if (watchers[fromColId].busy) return
+  function spawnOne() {
+    const w = watchers[fromColId]
+    if (!w || w.poolSize <= 0 || w.activeCount >= w.poolSize) return
     let cards
     try { cards = fs.readdirSync(fromPath).filter(f => f.endsWith('.md') && !f.endsWith('.wip')) } catch { return }
     if (cards.length === 0) return
 
-    watchers[fromColId].busy = true
-
+    const { repo } = loadConfig()
     const cardSlug = cards[0].replace(/\.md$/, '')
     const workspaceInstructions = repo
       ? 'Create a jj workspace at ' + path.resolve(repo, '..', cardSlug) + ' before doing any work ' +
@@ -146,39 +182,100 @@ function startWatcher(fromColId) {
       'If you cannot proceed without a human decision, move it to ' + path.join(BOARD_DIR, 'blocked') + '/ instead ' +
       'and document the question clearly in the card.'
 
+    const agentType = transition.command || transition.to
+    boardLog(agentType + ' ' + cardSlug + ' started')
+
     const proc = spawn('claude', [
       '-p', prompt,
       '--system-prompt', fs.readFileSync(transition.agentPath, 'utf8'),
       '--dangerously-skip-permissions'
     ], { stdio: 'inherit' })
-    watchers[fromColId].process = proc
-    proc.on('close', () => {
-      if (watchers[fromColId]) { watchers[fromColId].busy = false; watchers[fromColId].process = null }
+
+    w.activeCount++
+    w.processes.push(proc)
+
+    proc.on('close', (code) => {
+      const w2 = watchers[fromColId]
+      if (w2) {
+        w2.activeCount = Math.max(0, w2.activeCount - 1)
+        const idx = w2.processes.indexOf(proc)
+        if (idx !== -1) w2.processes.splice(idx, 1)
+        // Only spawn a replacement if pool still allows it (spec criteria 9-11)
+        if (w2.poolSize > 0 && w2.activeCount < w2.poolSize) setTimeout(spawnOne, 500)
+      }
+      if (code === 0) {
+        boardLog(agentType + ' ' + cardSlug + ' success')
+      } else {
+        boardLog(agentType + ' ' + cardSlug + ' failed')
+      }
     })
   }
 
-  const fsWatcher = fs.watch(fromPath, (_, filename) => {
-    if (!filename || !filename.endsWith('.md') || filename.endsWith('.wip')) return
-    clearTimeout(watchers[fromColId].debounce)
-    watchers[fromColId].debounce = setTimeout(runAgent, 500)
-  })
+  return spawnOne
+}
 
-  watchers[fromColId] = { fsWatcher, debounce: null, busy: false, process: null, transition }
+function incrementPool(fromColId) {
+  const transition = transitionFrom(fromColId)
+  if (!transition || !transition.agentPath) return false
+
+  const fromPath = path.join(BOARD_DIR, fromColId)
+  try { fs.mkdirSync(fromPath, { recursive: true }) } catch {}
+
+  if (!watchers[fromColId]) {
+    watchers[fromColId] = {
+      fsWatcher:   null,
+      debounce:    null,
+      poolSize:    0,
+      activeCount: 0,
+      processes:   [],
+      transition,
+      spawnOne:    makeSpawnOne(fromColId, transition)
+    }
+  }
+
+  const w = watchers[fromColId]
+  w.poolSize++
+
+  // Start filesystem watcher on first slot (spec criterion 4)
+  if (!w.fsWatcher) {
+    w.fsWatcher = fs.watch(fromPath, (_, filename) => {
+      if (!filename || !filename.endsWith('.md') || filename.endsWith('.wip')) return
+      const w2 = watchers[fromColId]
+      if (!w2) return
+      clearTimeout(w2.debounce)
+      w2.debounce = setTimeout(w2.spawnOne, 500)
+    })
+  }
+
+  // Try to fill the new slot immediately (spec criterion 4)
+  setTimeout(w.spawnOne, 500)
   return true
 }
 
-function stopWatcher(fromColId) {
-  if (!watchers[fromColId]) return false
-  clearTimeout(watchers[fromColId].debounce)
-  watchers[fromColId].fsWatcher.close()
-  if (watchers[fromColId].process) watchers[fromColId].process.kill()
-  delete watchers[fromColId]
+function decrementPool(fromColId) {
+  const w = watchers[fromColId]
+  if (!w || w.poolSize <= 0) return false  // spec criterion 6: no-op at 0
+
+  w.poolSize--
+
+  // Stop filesystem watching when pool reaches 0 (spec criterion 11)
+  // Active agents are NOT killed — they finish their current card naturally
+  if (w.poolSize === 0) {
+    clearTimeout(w.debounce)
+    w.debounce = null
+    if (w.fsWatcher) { w.fsWatcher.close(); w.fsWatcher = null }
+  }
+
   return true
 }
 
 function watcherStatus() {
+  // Return all columns with transitions, even those at poolSize 0 (spec criterion 13)
   const s = {}
-  for (const [id, w] of Object.entries(watchers)) s[id] = { running: true, busy: w.busy, to: w.transition.to }
+  for (const t of getTransitions()) {
+    const w = watchers[t.from]
+    s[t.from] = { poolSize: w ? w.poolSize : 0, activeCount: w ? w.activeCount : 0, to: t.to }
+  }
   return s
 }
 
@@ -214,7 +311,8 @@ Do not write any code. Do not implement anything.
   implementation: `You are an implementer. Your only job is to write code that satisfies a spec.
 The orchestrator will tell you which card to pick up and where to move it when done.
 
-Read the card fully before writing any code.
+Read the card fully before writing any code. If the card contains a "## Workspace" section,
+do all your work inside that workspace directory — jj tracks changes automatically, no staging needed.
 
 Rules:
 - Implement only what the spec says. Nothing more.
@@ -222,13 +320,13 @@ Rules:
 - Do not refactor surrounding code unless it directly blocks the spec.
 - If a criterion is ambiguous, use the most conservative reading and leave a
   TODO comment flagging it.
-- When done, stage your changes with git but do not commit.
 `,
 
   testing: `You are a test writer. Your only job is to write tests that verify a spec.
 The orchestrator will tell you which card to pick up and where to move it when done.
 
-Read the card and the current git diff before writing any tests.
+Read the card before writing any tests. If the card contains a "## Workspace" section,
+work inside that workspace directory and run \`jj diff\` to see what changed.
 
 Rules:
 - Write one test per acceptance criterion, named after the criterion.
@@ -238,10 +336,11 @@ Rules:
 - All tests must pass before you are done. Run them and iterate until green.
 `,
 
-  review: `You are a code reviewer. Your only job is to critique the current diff.
+  review: `You are a code reviewer. Your only job is to critique the current diff and merge it if approved.
 The orchestrator will tell you which card to pick up and where to move it when done.
 
-Read the card and run git diff HEAD before doing anything else.
+Read the card before doing anything else. If the card contains a "## Workspace" section,
+run \`jj diff\` inside that workspace directory to see the changes under review.
 
 Append your findings to the card under a "## Review" heading:
 
@@ -251,7 +350,13 @@ Append your findings to the card under a "## Review" heading:
 4. Edge cases — inputs or states that could cause unexpected behaviour?
 5. Verdict — APPROVED, APPROVED WITH NOTES, or CHANGES REQUIRED.
 
-Do not fix anything. Do not write code. Critique only.
+If the verdict is APPROVED or APPROVED WITH NOTES:
+- In the main repo, rebase the workspace changes onto the default branch and forget the workspace:
+    jj rebase -d trunk() --branch <workspace_change_id>
+    jj workspace forget <workspace_path>
+- The workspace path is in the card under "## Workspace".
+
+Do not fix anything. Do not write code. Critique only — merging on approval is the sole exception.
 `,
 }
 
@@ -334,10 +439,14 @@ const HTML = `<!DOCTYPE html>
         <div class="flex items-center gap-3 mt-1">
           <button id="modal-edit-btn" onclick="enterEditMode()"
                   class="text-xs text-gray-500 hover:text-gray-300">Edit</button>
+          <button id="modal-delete-btn" onclick="deleteCard()"
+                  class="text-xs text-red-500 hover:text-red-400">Delete</button>
           <button id="modal-save-btn" onclick="saveCard()"
                   class="hidden text-xs text-blue-400 hover:text-blue-300">Save</button>
           <button id="modal-cancel-btn" onclick="exitEditMode()"
                   class="hidden text-xs text-gray-500 hover:text-gray-300">Cancel</button>
+          <select id="modal-move" onchange="moveCard(this.value)"
+                  class="text-xs text-gray-500 bg-gray-800 border border-gray-700 rounded px-2 py-1 focus:outline-none hover:border-gray-500"></select>
           <button onclick="closeModal('modal')" class="text-gray-500 hover:text-white text-2xl leading-none">&times;</button>
         </div>
       </div>
@@ -437,10 +546,12 @@ const HTML = `<!DOCTYPE html>
         wrap.style.cssText = 'min-width:200px;max-width:220px;border-top-color:' + col.color
         wrap.className = 'flex-shrink-0 rounded-xl bg-gray-800/60 border-t-2 p-3'
 
+        // Pool size control: - [poolSize] + (spec criteria 1, 7, 12)
+        const poolSize = (trans && ws) ? (ws.poolSize || 0) : 0
         const watchBtn = trans
-          ? (ws
-              ? '<button class="stop-watcher text-xs ' + (ws.busy ? 'text-yellow-400' : 'text-red-400 hover:text-red-300') + '" data-col="' + col.id + '" title="Stop (' + col.label + ' → ' + colInfo(trans.to).label + ')">' + (ws.busy ? '<span class="animate-spin inline-block">⟳</span>' : '■') + '</button>'
-              : '<button class="start-watcher text-xs text-gray-500 hover:text-green-400" data-col="' + col.id + '" title="Start (' + col.label + ' → ' + colInfo(trans.to).label + ')">▶</button>')
+          ? '<button class="pool-dec text-xs ' + (poolSize === 0 ? 'text-gray-600 opacity-50' : 'text-gray-500 hover:text-gray-300') + '" data-col="' + col.id + '" title="Decrease pool size"' + (poolSize === 0 ? ' disabled' : '') + '>-</button>' +
+            '<span class="text-xs text-gray-400 tabular-nums px-1">' + poolSize + '</span>' +
+            '<button class="pool-inc text-xs text-gray-500 hover:text-gray-300" data-col="' + col.id + '" title="Increase pool size">+</button>'
           : ''
 
         const cmdBtn = trans && trans.agentPath
@@ -474,16 +585,16 @@ const HTML = `<!DOCTYPE html>
     }
 
     document.getElementById('board').addEventListener('click', e => {
-      const card  = e.target.closest('[data-col][data-name]')
-      const add   = e.target.closest('.add-card')
-      const start = e.target.closest('.start-watcher')
-      const stop  = e.target.closest('.stop-watcher')
-      const cmd   = e.target.closest('.view-cmd')
-      if (card)  openCard(card.dataset.col, card.dataset.name)
-      if (add)   openAddModal(add.dataset.col)
-      if (start) toggleWatcher(start.dataset.col, 'start')
-      if (stop)  toggleWatcher(stop.dataset.col, 'stop')
-      if (cmd)   openCommand(cmd.dataset.col)
+      const card    = e.target.closest('[data-col][data-name]')
+      const add     = e.target.closest('.add-card')
+      const poolDec = e.target.closest('.pool-dec')
+      const poolInc = e.target.closest('.pool-inc')
+      const cmd     = e.target.closest('.view-cmd')
+      if (card)    openCard(card.dataset.col, card.dataset.name)
+      if (add)     openAddModal(add.dataset.col)
+      if (poolDec) adjustPool(poolDec.dataset.col, -1)
+      if (poolInc) adjustPool(poolInc.dataset.col, 1)
+      if (cmd)     openCommand(cmd.dataset.col)
     })
 
     let currentCard = null
@@ -497,9 +608,18 @@ const HTML = `<!DOCTYPE html>
       document.getElementById('modal-body').innerHTML    = '<p class="text-gray-500 text-sm">Loading...</p>'
       document.getElementById('modal').classList.remove('hidden')
       exitEditMode()
+      const deleteBtn = document.getElementById('modal-delete-btn')
+      if (name.endsWith('.wip')) {
+        deleteBtn.classList.add('hidden')
+      } else {
+        deleteBtn.classList.remove('hidden')
+      }
       const content = await fetch('/api/card/' + encodeURIComponent(colId) + '/' + encodeURIComponent(name)).then(r => r.text())
       currentCard = { colId, name, content }
       document.getElementById('modal-body').innerHTML = marked.parse(content)
+      const sel = document.getElementById('modal-move')
+      sel.innerHTML = '<option value="">Move to\u2026</option>' +
+        COLUMNS.filter(c => c.id !== colId).map(c => '<option value="' + c.id + '">' + c.label + '</option>').join('')
     }
 
     function enterEditMode() {
@@ -534,6 +654,18 @@ const HTML = `<!DOCTYPE html>
       exitEditMode()
     }
 
+    async function deleteCard() {
+      if (!currentCard) return
+      if (!confirm('Delete "' + cardTitle(currentCard.name) + '"? This cannot be undone.')) return
+      const res = await fetch('/api/card/' + encodeURIComponent(currentCard.colId) + '/' + encodeURIComponent(currentCard.name), {
+        method: 'DELETE'
+      })
+      if (res.ok) {
+        closeModal('modal')
+        refresh()
+      }
+    }
+
     async function openCommand(colId) {
       document.getElementById('cmd-title').textContent = colInfo(colId).label + ' — command'
       document.getElementById('cmd-body').textContent  = 'Loading...'
@@ -566,8 +698,23 @@ const HTML = `<!DOCTYPE html>
       refresh()
     })
 
-    async function toggleWatcher(colId, action) {
-      await fetch('/api/watcher/' + encodeURIComponent(colId) + '/' + action, { method: 'POST' })
+    async function moveCard(toCol) {
+      if (!toCol || !currentCard) return
+      await fetch('/api/card/move', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ col: currentCard.colId, filename: currentCard.name, toCol })
+      })
+      closeModal('modal')
+      refresh()
+    }
+
+    async function adjustPool(colId, delta) {
+      await fetch('/api/watcher/' + encodeURIComponent(colId) + '/pool', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ delta })
+      })
       refresh()
     }
 
@@ -601,9 +748,19 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(watcherStatus()))
   }
 
-  const watcherM = url.pathname.match(/^\/api\/watcher\/([^/]+)\/(start|stop)$/)
-  if (watcherM && req.method === 'POST') {
-    const ok = watcherM[2] === 'start' ? startWatcher(decodeURIComponent(watcherM[1])) : stopWatcher(decodeURIComponent(watcherM[1]))
+  // Removed: POST /api/watcher/{colId}/start and /stop — spec criterion 14
+  if (url.pathname.match(/^\/api\/watcher\/[^/]+\/(start|stop)$/) && req.method === 'POST') {
+    res.writeHead(404); return res.end('Not found')
+  }
+
+  // New pool-size control endpoint — spec criterion 15
+  const poolM = url.pathname.match(/^\/api\/watcher\/([^/]+)\/pool$/)
+  if (poolM && req.method === 'POST') {
+    const colId = decodeURIComponent(poolM[1])
+    const { delta } = await readBody(req)
+    let ok = false
+    if (delta === 1)  ok = incrementPool(colId)
+    if (delta === -1) ok = decrementPool(colId)
     res.writeHead(ok ? 200 : 400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok }))
   }
 
@@ -617,6 +774,25 @@ const server = http.createServer(async (req, res) => {
     catch { res.writeHead(404); return res.end('Not found') }
   }
 
+  if (url.pathname === '/api/card/move' && req.method === 'POST') {
+    const { col, filename, toCol } = await readBody(req)
+    if (!col || !filename || !toCol) { res.writeHead(400); return res.end('Missing fields') }
+    const cols = getColumns()
+    if (!cols.find(c => c.id === col) || !cols.find(c => c.id === toCol)) { res.writeHead(400); return res.end('Invalid column') }
+    const fromResolved = path.resolve(path.join(BOARD_DIR, col, filename))
+    const toDir = path.resolve(path.join(BOARD_DIR, toCol))
+    const toResolved = path.resolve(path.join(toDir, filename))
+    if (!fromResolved.startsWith(BOARD_DIR + path.sep) || !toResolved.startsWith(BOARD_DIR + path.sep)) {
+      res.writeHead(400); return res.end('Invalid path')
+    }
+    try {
+      fs.mkdirSync(toDir, { recursive: true })
+      fs.renameSync(fromResolved, toResolved)
+      boardLog('move ' + fromResolved + ' ' + toResolved)
+      res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true }))
+    } catch { res.writeHead(500); return res.end('Failed') }
+  }
+
   if (url.pathname === '/api/card' && req.method === 'POST') {
     const { col, name, brief } = await readBody(req)
     if (!col || !name || !brief) { res.writeHead(400); return res.end('Missing fields') }
@@ -626,6 +802,16 @@ const server = http.createServer(async (req, res) => {
   }
 
   const cardM = url.pathname.match(/^\/api\/card\/([^/]+)\/([^/]+)$/)
+  if (cardM && req.method === 'DELETE') {
+    const col = decodeURIComponent(cardM[1])
+    const filename = decodeURIComponent(cardM[2])
+    if (filename.endsWith('.wip')) { res.writeHead(409); return res.end('Cannot delete a card currently being processed') }
+    const resolved = path.resolve(path.join(BOARD_DIR, col, filename))
+    if (!resolved.startsWith(BOARD_DIR + path.sep)) { res.writeHead(403); return res.end('Forbidden') }
+    if (!fs.existsSync(resolved)) { res.writeHead(400); return res.end('File not found') }
+    try { fs.unlinkSync(resolved); res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true })) }
+    catch { res.writeHead(500); return res.end('Failed') }
+  }
   if (cardM && req.method === 'PUT') {
     const body = await new Promise(resolve => { let b = ''; req.on('data', c => b += c); req.on('end', () => resolve(b)) })
     const ok = writeCard(decodeURIComponent(cardM[1]), decodeURIComponent(cardM[2]), body)
