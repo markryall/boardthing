@@ -9,6 +9,13 @@ const { spawn } = require('child_process')
 const BOARD_DIR = path.resolve(process.argv[2] || './.board')
 const PORT = process.argv[3] || 3000
 
+function repoTitle() {
+  const dirName = path.basename(path.dirname(BOARD_DIR))
+  return dirName
+    .replace(/[-_]/g, ' ')
+    .replace(/\b\w+/g, w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+}
+
 const DEFAULT_COLORS = ['#3b82f6','#60a5fa','#818cf8','#7c3aed','#9333ea','#a855f7','#c026d3','#d946ef','#ec4899','#f472b6']
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -803,10 +810,14 @@ const server = http.createServer(async (req, res) => {
 
   if (url.pathname === '/') {
     const boardContent = renderBoardHTML()
-    const html = HTML.replace(
-      'id="board" class="flex gap-4 pb-4 items-start" style="min-width: max-content">',
-      'id="board" class="flex gap-4 pb-4 items-start" style="min-width: max-content">' + boardContent
-    )
+    const title = repoTitle()
+    const html = HTML
+      .replace('<title>Board</title>', '<title>' + title + '</title>')
+      .replace('>Board</h1>', '>' + title + '</h1>')
+      .replace(
+        'id="board" class="flex gap-4 pb-4 items-start" style="min-width: max-content">',
+        'id="board" class="flex gap-4 pb-4 items-start" style="min-width: max-content">' + boardContent
+      )
     res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(html)
   }
   if (url.pathname === '/api/config') {
