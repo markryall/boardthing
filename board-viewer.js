@@ -427,6 +427,11 @@ const HTML = `<!DOCTYPE html>
     body { background: #0f1117; }
     .card { transition: transform 0.1s, background 0.1s; }
     .card:hover { transform: translateY(-2px); }
+    @keyframes card-arrive {
+      from { opacity: 0; transform: translateY(-8px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .card-just-arrived { animation: card-arrive 0.4s ease-out; }
   </style>
 </head>
 <body class="text-gray-100 min-h-screen p-6">
@@ -535,6 +540,7 @@ const HTML = `<!DOCTYPE html>
     }
 
     let COLUMNS = [], TRANSITIONS = []
+    let prevCardCols = null
 
     function cardTitle(f) { return f.replace(/\\.md(\\.wip)?$/, '').replace(/[-_]/g, ' ') }
     function colInfo(id)  { return COLUMNS.find(c => c.id === id) || { label: id, color: '#888' } }
@@ -567,7 +573,6 @@ const HTML = `<!DOCTYPE html>
         wrap.style.cssText = 'min-width:200px;max-width:280px;border-top-color:' + col.color
         wrap.className = 'flex-shrink-0 rounded-xl bg-gray-800/60 border-t-2 p-3'
 
-        // Pool size control: - [poolSize] + (spec criteria 1, 7, 12)
         const poolSize = (trans && ws) ? (ws.poolSize || 0) : 0
         const watchBtn = trans
           ? '<button class="pool-dec text-xs ' + (poolSize === 0 ? 'text-gray-600 opacity-50' : 'text-gray-500 hover:text-gray-300') + '" data-col="' + col.id + '" title="Decrease pool size"' + (poolSize === 0 ? ' disabled' : '') + '>▼</button>' +
@@ -602,6 +607,22 @@ const HTML = `<!DOCTYPE html>
           '</div>'
 
         el.appendChild(wrap)
+        if (prevCardCols) for (const c of cards) {
+          if (prevCardCols[c.name] !== undefined && prevCardCols[c.name] !== col.id) {
+            const ce = wrap.querySelector('[data-name="' + encodeURIComponent(c.name) + '"]')
+            if (ce) {
+              ce.classList.add('card-just-arrived')
+              ce.addEventListener('animationend', () => ce.classList.remove('card-just-arrived'), { once: true })
+            }
+          }
+        }
+      }
+
+      // Update previous card column tracking
+      prevCardCols = {}
+      for (const col of COLUMNS) {
+        const cards = board[col.id] || []
+        for (const c of cards) prevCardCols[c.name] = col.id
       }
     }
 
