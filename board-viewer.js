@@ -9,7 +9,7 @@ const { spawn } = require('child_process')
 const BOARD_DIR = path.resolve(process.argv[2] || './.board')
 const PORT = process.argv[3] || 3000
 
-const DEFAULT_COLORS = ['#6b7280','#3b82f6','#eab308','#f97316','#a855f7','#22c55e','#ef4444','#ec4899']
+const DEFAULT_COLORS = ['#3b82f6','#60a5fa','#818cf8','#7c3aed','#9333ea','#a855f7','#c026d3','#d946ef','#ec4899','#f472b6']
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
@@ -56,7 +56,7 @@ function getTransitions() {
   const { transitions } = loadConfig()
   return (transitions || []).map(t => ({
     ...t,
-    agentPath: findAgentPath(t.command || t.to),
+    agentPath: findAgentPath(t.agent || t.to),
     label: colLabel(t.to),
   }))
 }
@@ -84,12 +84,39 @@ function readBoard() {
   return board
 }
 
+function renderBoardHTML() {
+  const board = readBoard()
+  const cols = getColumns()
+  return cols.map(col => {
+    const cards = board[col.id] || []
+    const cardItems = cards.map(c => {
+      const encodedName = encodeURIComponent(c.name)
+      const title = c.name.replace(/\.md(\.wip)?$/, '').replace(/[-_]/g, ' ')
+      const dragAttrs = c.wip ? '' : ` draggable="true" ondragstart="dragCard(event,'${col.id}','${encodedName}')"`
+      const cls = c.wip
+        ? 'bg-gray-700/50 border border-dashed border-gray-500 text-gray-400'
+        : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+      const pulse = c.wip ? '<span class="inline-block w-2 h-2 rounded-full bg-yellow-400 animate-pulse mr-2"></span>' : ''
+      return `<div class="card cursor-pointer rounded-lg px-3 py-2 text-sm shadow-sm ${cls}" data-col="${col.id}" data-name="${encodedName}"${dragAttrs}>${pulse}${title}</div>`
+    }).join('\n')
+    return (
+      `<div class="flex-shrink-0 rounded-xl bg-gray-800/60 border-t-2 p-3" style="min-width:200px;max-width:280px;border-top-color:${col.color}">` +
+      `<div class="flex items-center justify-between mb-3">` +
+      `<span class="text-xs font-semibold text-gray-400 uppercase tracking-wide">${col.label}</span>` +
+      `<span class="text-xs bg-gray-700 text-gray-400 rounded-full px-2 py-0.5">${cards.length}</span>` +
+      `</div>` +
+      `<div class="space-y-2" ondragover="event.preventDefault()" ondrop="dropCard(event,'${col.id}')">${cardItems}</div>` +
+      `</div>`
+    )
+  }).join('\n')
+}
+
 function readCard(col, filename) {
   const resolved = path.resolve(path.join(BOARD_DIR, col, filename))
   if (!resolved.startsWith(BOARD_DIR + path.sep)) return null
   try {
     const content = fs.readFileSync(resolved, 'utf8')
-    boardLog('read ' + resolved)
+    boardLog('read ' + boardRelative(resolved))
     return content
   } catch { return null }
 }
@@ -99,7 +126,7 @@ function writeCard(col, filename, content) {
   if (!resolved.startsWith(BOARD_DIR + path.sep)) return false
   try {
     fs.writeFileSync(resolved, content)
-    boardLog('write ' + resolved)
+    boardLog('write ' + boardRelative(resolved))
     return true
   } catch { return false }
 }
@@ -112,27 +139,24 @@ function createCard(colId, name, brief) {
   if (!resolved.startsWith(BOARD_DIR + path.sep)) return null
   fs.mkdirSync(colPath, { recursive: true })
   fs.writeFileSync(resolved, '# Brief\n\n' + brief.trim() + '\n')
-  boardLog('write ' + resolved)
+  boardLog('write ' + boardRelative(resolved))
   return filename
 }
 
 // ── Logging ──────────────────────────────────────────────────────────────────
 
-function isoTimestampLocal() {
+function timeOnlyLocal() {
   const d = new Date()
   const pad = n => String(n).padStart(2, '0')
-  const offset = -d.getTimezoneOffset()
-  const sign = offset >= 0 ? '+' : '-'
-  const abs = Math.abs(offset)
-  const oh = pad(Math.floor(abs / 60))
-  const om = pad(abs % 60)
-  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
-    'T' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()) +
-    sign + oh + ':' + om
+  return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds())
 }
 
 function boardLog(message) {
-  process.stdout.write(isoTimestampLocal() + ' [boardthing] ' + message + '\n')
+  process.stdout.write(timeOnlyLocal() + ' ' + message + '\n')
+}
+
+function boardRelative(absPath) {
+  return path.relative(BOARD_DIR, absPath)
 }
 
 // TODO: Spec criterion 6 (log "rename" when an agent renames a card file, e.g. .md → .md.wip
@@ -182,7 +206,7 @@ function makeSpawnOne(fromColId, transition) {
       'If you cannot proceed without a human decision, move it to ' + path.join(BOARD_DIR, 'blocked') + '/ instead ' +
       'and document the question clearly in the card.'
 
-    const agentType = transition.command || transition.to
+    const agentType = transition.agent || transition.to
     boardLog(agentType + ' ' + cardSlug + ' started')
 
     const proc = spawn('claude', [
@@ -282,15 +306,13 @@ function watcherStatus() {
 // ── Bootstrap ────────────────────────────────────────────────────────────────
 
 const DEFAULT_COMMANDS = {
-  specification: `You are a spec writer. Your only job is to take a raw card brief and produce
-a precise, unambiguous specification. The orchestrator will tell you which card
-to pick up and where to move it when done.
+  spec: `You are a spec writer and test designer. Your job is to take a raw card brief,
+produce a precise specification, and write executable failing tests that define done.
+The orchestrator will tell you which card to pick up and where to move it when done.
 
-Elaborate the card in-place, then move it as instructed. If there are blocking
-open questions that prevent a useful spec, move it to the blocked folder instead
-and document the blockers clearly.
+If the card contains a "## Workspace" section, do all your work inside that workspace directory.
 
-Structure the spec as:
+Step 1 — Write the spec. Elaborate the card in-place with this structure:
 
 ## Goal
 One sentence describing the outcome.
@@ -305,35 +327,30 @@ Explicitly list what this change does NOT do.
 ## Open questions
 Anything ambiguous that needs a human decision. If none, write "None".
 
-Do not write any code. Do not implement anything.
+If there are blocking open questions, move the card to the blocked folder instead
+and document the blockers clearly. Do not proceed to step 2.
+
+Step 2 — Write failing tests. One test per acceptance criterion, named after it.
+Tests must fail because the implementation does not exist yet — not due to syntax errors.
+Prefer integration tests that test behaviour, not implementation details.
+Record the test file path(s) in the card under a "## Tests" heading.
+
+Do not write any implementation code.
 `,
 
-  implementation: `You are an implementer. Your only job is to write code that satisfies a spec.
+  implement: `You are an implementer. Your only job is to write code that makes the failing tests pass.
 The orchestrator will tell you which card to pick up and where to move it when done.
 
 Read the card fully before writing any code. If the card contains a "## Workspace" section,
 do all your work inside that workspace directory — jj tracks changes automatically, no staging needed.
+The test files are listed under "## Tests" in the card.
 
 Rules:
-- Implement only what the spec says. Nothing more.
-- Do not write tests — that is a separate agent's job.
+- Run the tests first to confirm they fail, then implement until they pass.
+- Implement only what is needed to make the tests pass. Nothing more.
+- Do not modify the tests.
 - Do not refactor surrounding code unless it directly blocks the spec.
-- If a criterion is ambiguous, use the most conservative reading and leave a
-  TODO comment flagging it.
-`,
-
-  testing: `You are a test writer. Your only job is to write tests that verify a spec.
-The orchestrator will tell you which card to pick up and where to move it when done.
-
-Read the card before writing any tests. If the card contains a "## Workspace" section,
-work inside that workspace directory and run \`jj diff\` to see what changed.
-
-Rules:
-- Write one test per acceptance criterion, named after the criterion.
-- Prefer integration tests — test behaviour, not implementation details.
-- Do not change production code. If you find a bug, write a failing test that
-  exposes it and leave a comment, but do not fix it.
-- All tests must pass before you are done. Run them and iterate until green.
+- All tests must be green before you move the card on.
 `,
 
   review: `You are a code reviewer. Your only job is to critique the current diff and merge it if approved.
@@ -361,12 +378,11 @@ Do not fix anything. Do not write code. Critique only — merging on approval is
 }
 
 const DEFAULT_CONFIG = {
-  columns: ['backlog', 'specification', 'implementation', 'testing', 'review', 'done', 'blocked'],
+  columns: ['backlog', 'specification', 'implementation', 'done', 'blocked'],
   transitions: [
-    { from: 'backlog',        to: 'specification'  },
-    { from: 'specification',  to: 'implementation' },
-    { from: 'implementation', to: 'testing'        },
-    { from: 'testing',        to: 'review'         },
+    { from: 'backlog',        to: 'specification',  agent: 'spec'      },
+    { from: 'specification',  to: 'implementation', agent: 'implement' },
+    { from: 'implementation', to: 'done',           agent: 'review'    },
   ]
 }
 
@@ -406,10 +422,7 @@ const HTML = `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <title>Board</title>
-  <script src="https://cdn.tailwindcss.com?plugins=typography"></script>
-  <script src="https://cdn.jsdelivr.net/npm/marked@13/marked.min.js"></script>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
   <style>
     body { background: #0f1117; }
     .card { transition: transform 0.1s, background 0.1s; }
@@ -450,9 +463,7 @@ const HTML = `<!DOCTYPE html>
           <button onclick="closeModal('modal')" class="text-gray-500 hover:text-white text-2xl leading-none">&times;</button>
         </div>
       </div>
-      <div id="modal-body" class="overflow-y-auto p-6 prose prose-invert prose-sm max-w-none
-                                   prose-headings:text-gray-200 prose-hr:border-gray-700
-                                   prose-code:text-pink-400 prose-pre:p-0 prose-pre:bg-transparent"></div>
+      <div id="modal-body" class="overflow-y-auto p-6 text-sm text-gray-300"></div>
       <textarea id="modal-editor"
                 class="hidden flex-1 m-4 p-4 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 font-mono resize-none focus:outline-none focus:border-blue-500 min-h-[300px]"></textarea>
     </div>
@@ -501,17 +512,27 @@ const HTML = `<!DOCTYPE html>
   </div>
 
   <script>
-    marked.use({
-      renderer: (() => {
-        const r = new marked.Renderer()
-        r.code = ({ text, lang }) => {
-          const language = (lang && hljs.getLanguage(lang)) ? lang : 'plaintext'
-          const html = hljs.highlight(text, { language }).value
-          return '<pre class="rounded-lg overflow-x-auto"><code class="hljs language-' + language + '">' + html + '</code></pre>'
-        }
-        return r
-      })()
-    })
+    function dragCard(event, col, encodedName) {
+      event.dataTransfer.setData('text/plain', JSON.stringify({ col: col, filename: decodeURIComponent(encodedName) }))
+    }
+
+    async function dropCard(event, toCol) {
+      event.preventDefault()
+      const data = JSON.parse(event.dataTransfer.getData('text/plain'))
+      await fetch('/api/card/move', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ col: data.col, filename: data.filename, toCol: toCol })
+      })
+      refresh()
+    }
+
+    function renderContent(el, text) {
+      const pre = document.createElement('pre')
+      pre.style.whiteSpace = 'pre-wrap'
+      pre.textContent = text
+      el.replaceChildren(pre)
+    }
 
     let COLUMNS = [], TRANSITIONS = []
 
@@ -543,15 +564,15 @@ const HTML = `<!DOCTYPE html>
         const ws    = status[col.id]
         const trans = transitionFrom(col.id)
         const wrap  = document.createElement('div')
-        wrap.style.cssText = 'min-width:200px;max-width:220px;border-top-color:' + col.color
+        wrap.style.cssText = 'min-width:200px;max-width:280px;border-top-color:' + col.color
         wrap.className = 'flex-shrink-0 rounded-xl bg-gray-800/60 border-t-2 p-3'
 
         // Pool size control: - [poolSize] + (spec criteria 1, 7, 12)
         const poolSize = (trans && ws) ? (ws.poolSize || 0) : 0
         const watchBtn = trans
-          ? '<button class="pool-dec text-xs ' + (poolSize === 0 ? 'text-gray-600 opacity-50' : 'text-gray-500 hover:text-gray-300') + '" data-col="' + col.id + '" title="Decrease pool size"' + (poolSize === 0 ? ' disabled' : '') + '>-</button>' +
+          ? '<button class="pool-dec text-xs ' + (poolSize === 0 ? 'text-gray-600 opacity-50' : 'text-gray-500 hover:text-gray-300') + '" data-col="' + col.id + '" title="Decrease pool size"' + (poolSize === 0 ? ' disabled' : '') + '>▼</button>' +
             '<span class="text-xs text-gray-400 tabular-nums px-1">' + poolSize + '</span>' +
-            '<button class="pool-inc text-xs text-gray-500 hover:text-gray-300" data-col="' + col.id + '" title="Increase pool size">+</button>'
+            '<button class="pool-inc text-xs text-gray-500 hover:text-gray-300" data-col="' + col.id + '" title="Increase pool size">▲</button>'
           : ''
 
         const cmdBtn = trans && trans.agentPath
@@ -616,7 +637,7 @@ const HTML = `<!DOCTYPE html>
       }
       const content = await fetch('/api/card/' + encodeURIComponent(colId) + '/' + encodeURIComponent(name)).then(r => r.text())
       currentCard = { colId, name, content }
-      document.getElementById('modal-body').innerHTML = marked.parse(content)
+      renderContent(document.getElementById('modal-body'), content)
       const sel = document.getElementById('modal-move')
       sel.innerHTML = '<option value="">Move to\u2026</option>' +
         COLUMNS.filter(c => c.id !== colId).map(c => '<option value="' + c.id + '">' + c.label + '</option>').join('')
@@ -650,7 +671,7 @@ const HTML = `<!DOCTYPE html>
         body: content
       })
       currentCard.content = content
-      document.getElementById('modal-body').innerHTML = marked.parse(content)
+      renderContent(document.getElementById('modal-body'), content)
       exitEditMode()
     }
 
@@ -735,7 +756,12 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x')
 
   if (url.pathname === '/') {
-    res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(HTML)
+    const boardContent = renderBoardHTML()
+    const html = HTML.replace(
+      'id="board" class="flex gap-4 pb-4 items-start" style="min-width: max-content">',
+      'id="board" class="flex gap-4 pb-4 items-start" style="min-width: max-content">' + boardContent
+    )
+    res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(html)
   }
   if (url.pathname === '/api/config') {
     res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -768,7 +794,7 @@ const server = http.createServer(async (req, res) => {
   if (cmdM) {
     const fromColId = decodeURIComponent(cmdM[1])
     const transition = transitionFrom(fromColId)
-    const agentPath = transition && findAgentPath(transition.command || transition.to)
+    const agentPath = transition && findAgentPath(transition.agent || transition.to)
     if (!agentPath) { res.writeHead(404); return res.end('No agent for this column') }
     try { res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end(fs.readFileSync(agentPath, 'utf8')) }
     catch { res.writeHead(404); return res.end('Not found') }
@@ -788,7 +814,7 @@ const server = http.createServer(async (req, res) => {
     try {
       fs.mkdirSync(toDir, { recursive: true })
       fs.renameSync(fromResolved, toResolved)
-      boardLog('move ' + fromResolved + ' ' + toResolved)
+      boardLog('move ' + boardRelative(fromResolved) + ' ' + boardRelative(toResolved))
       res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true }))
     } catch { res.writeHead(500); return res.end('Failed') }
   }
