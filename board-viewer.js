@@ -14,20 +14,43 @@ const DEFAULT_COLORS = ['#3b82f6','#60a5fa','#818cf8','#7c3aed','#9333ea','#a855
 // ── Config ───────────────────────────────────────────────────────────────────
 
 function loadConfig() {
+  const configPath = path.join(BOARD_DIR, 'config.json')
   try {
-    const raw = JSON.parse(fs.readFileSync(path.join(BOARD_DIR, 'config.json'), 'utf8'))
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf8'))
     if (Array.isArray(raw)) return { columns: raw, transitions: [] }
     return { transitions: [], ...raw }
-  } catch {
-    return {
-      columns: ['backlog', 'specification', 'implementation', 'testing', 'review', 'done', 'blocked'],
-      transitions: [
-        { from: 'backlog',        to: 'specification'  },
-        { from: 'specification',  to: 'implementation' },
-        { from: 'implementation', to: 'testing'        },
-        { from: 'testing',        to: 'review'         },
-      ]
-    }
+  } catch (e) {
+    console.error('Error: could not read ' + configPath + ': ' + e.message)
+    process.exit(1)
+  }
+}
+
+function validateConfig() {
+  const configPath = path.join(BOARD_DIR, 'config.json')
+  const config = loadConfig()
+  const errors = []
+
+  if (!config.repo) errors.push('"repo" is required')
+
+  if (!config.columns || config.columns.length === 0) {
+    errors.push('"columns" must be a non-empty array')
+  }
+
+  const columnIds = new Set((config.columns || []).map(c => typeof c === 'string' ? c : c.id))
+
+  for (const [i, t] of (config.transitions || []).entries()) {
+    const prefix = 'transition ' + i
+    if (!t.from)  errors.push(prefix + ' missing "from"')
+    if (!t.to)    errors.push(prefix + ' missing "to"')
+    if (!t.agent) errors.push(prefix + ' missing "agent"')
+    if (t.from && !columnIds.has(t.from)) errors.push(prefix + ' "from" references unknown column "' + t.from + '"')
+    if (t.to   && !columnIds.has(t.to))   errors.push(prefix + ' "to" references unknown column "' + t.to + '"')
+  }
+
+  if (errors.length > 0) {
+    console.error('Invalid ' + configPath + ':')
+    for (const e of errors) console.error('  - ' + e)
+    process.exit(1)
   }
 }
 
@@ -56,7 +79,7 @@ function getTransitions() {
   const { transitions } = loadConfig()
   return (transitions || []).map(t => ({
     ...t,
-    agentPath: findAgentPath(t.agent || t.to),
+    agentPath: findAgentPath(t.agent),
     label: colLabel(t.to),
   }))
 }
@@ -189,14 +212,18 @@ function makeSpawnOne(fromColId, transition) {
     try { cards = fs.readdirSync(fromPath).filter(f => f.endsWith('.md') && !f.endsWith('.wip')) } catch { return }
     if (cards.length === 0) return
 
-    const { repo } = loadConfig()
+    const { repo: rawRepo } = loadConfig()
+    const repo = rawRepo.replace(/^~/, process.env.HOME)
     const cardSlug = cards[0].replace(/\.md$/, '')
-    const workspaceInstructions = repo
-      ? 'Create a jj workspace at ' + path.resolve(repo, '..', cardSlug) + ' before doing any work ' +
-        '(run: jj workspace add ' + path.resolve(repo, '..', cardSlug) + ' --repo ' + repo + '). ' +
+    const workspacePath = repo + '-' + cardSlug
+    const cardContent = fs.readFileSync(path.join(fromPath, cards[0]), 'utf8')
+    const hasWorkspace = /^## Workspace/m.test(cardContent)
+    const workspaceInstructions = hasWorkspace
+      ? 'Do all code changes inside the workspace recorded in the "## Workspace" section of the card. '
+      : 'Create a jj workspace at ' + workspacePath + ' before doing any work ' +
+        '(run: jj workspace add ' + workspacePath + ' --repo ' + repo + '). ' +
         'Do all code changes inside that workspace. ' +
         'Record the workspace path in the card under a "## Workspace" heading when done. '
-      : ''
 
     const prompt =
       'Pick up the oldest card from ' + fromPath + '/. ' +
@@ -310,8 +337,6 @@ const DEFAULT_COMMANDS = {
 produce a precise specification, and write executable failing tests that define done.
 The orchestrator will tell you which card to pick up and where to move it when done.
 
-If the card contains a "## Workspace" section, do all your work inside that workspace directory.
-
 Step 1 — Write the spec. Elaborate the card in-place with this structure:
 
 ## Goal
@@ -341,8 +366,8 @@ Do not write any implementation code.
   implement: `You are an implementer. Your only job is to write code that makes the failing tests pass.
 The orchestrator will tell you which card to pick up and where to move it when done.
 
-Read the card fully before writing any code. If the card contains a "## Workspace" section,
-do all your work inside that workspace directory — jj tracks changes automatically, no staging needed.
+Read the card fully before writing any code. Do all your work inside the workspace recorded
+in the card under "## Workspace" — jj tracks changes automatically, no staging needed.
 The test files are listed under "## Tests" in the card.
 
 Rules:
@@ -356,8 +381,8 @@ Rules:
   review: `You are a code reviewer. Your only job is to critique the current diff and merge it if approved.
 The orchestrator will tell you which card to pick up and where to move it when done.
 
-Read the card before doing anything else. If the card contains a "## Workspace" section,
-run \`jj diff\` inside that workspace directory to see the changes under review.
+Read the card before doing anything else. Run \`jj diff\` inside the workspace recorded
+in the card under "## Workspace" to see the changes under review.
 
 Append your findings to the card under a "## Review" heading:
 
@@ -883,6 +908,8 @@ const server = http.createServer(async (req, res) => {
 
   res.writeHead(404); res.end('Not found')
 })
+
+validateConfig()
 
 bootstrap()
 

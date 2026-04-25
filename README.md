@@ -53,9 +53,9 @@ Columns can be plain strings or objects with an `id` and optional `color` hex:
 { "id": "backlog", "color": "#3b82f6" }
 ```
 
-The `repo` field is optional. When set, each agent creates a separate jj
-workspace for the card before starting work, keeping changes isolated until
-reviewed.
+The `repo` field is optional. When set, cards that include a `## Workspace`
+section at the top will have a separate jj workspace created before the agent
+starts work, keeping changes isolated until reviewed.
 
 ### Agent command files
 
