@@ -37,7 +37,7 @@ function validateConfig() {
   const config = loadConfig()
   const errors = []
 
-  if (!config.repo) errors.push('"repo" is required')
+  if (config.workspace === true && !config.repo) errors.push('"repo" is required when "workspace" is true')
 
   if (!config.columns || config.columns.length === 0) {
     errors.push('"columns" must be a non-empty array')
@@ -219,18 +219,32 @@ function makeSpawnOne(fromColId, transition) {
     try { cards = fs.readdirSync(fromPath).filter(f => f.endsWith('.md') && !f.endsWith('.wip')) } catch { return }
     if (cards.length === 0) return
 
-    const { repo: rawRepo } = loadConfig()
-    const repo = rawRepo.replace(/^~/, process.env.HOME)
+    const config = loadConfig()
+    const useWorkspace = config.workspace !== false && config.repo
     const cardSlug = cards[0].replace(/\.md$/, '')
-    const workspacePath = repo + '-' + cardSlug
-    const cardContent = fs.readFileSync(path.join(fromPath, cards[0]), 'utf8')
-    const hasWorkspace = /^## Workspace/m.test(cardContent)
-    const workspaceInstructions = hasWorkspace
-      ? 'Do all code changes inside the workspace recorded in the "## Workspace" section of the card. '
-      : 'Create a jj workspace at ' + workspacePath + ' before doing any work ' +
-        '(run: jj workspace add ' + workspacePath + ' --repo ' + repo + '). ' +
-        'Do all code changes inside that workspace. ' +
-        'Record the workspace path in the card under a "## Workspace" heading when done. '
+    const agentType = transition.agent || transition.to
+    let workspaceInstructions = ''
+    if (useWorkspace) {
+      const repo = config.repo.replace(/^~/, process.env.HOME)
+      const workspacePath = repo + '-' + cardSlug
+      const cardContent = fs.readFileSync(path.join(fromPath, cards[0]), 'utf8')
+      const hasWorkspace = /^## Workspace/m.test(cardContent)
+      if (agentType === 'review') {
+        workspaceInstructions =
+          'Run `jj diff` inside the workspace recorded in the card under "## Workspace" to see the changes under review. ' +
+          'If the verdict is APPROVED or APPROVED WITH NOTES: ' +
+          'In the main repo, rebase the workspace changes onto the default branch and forget the workspace: ' +
+          '`jj rebase -d trunk() --branch <workspace_change_id>` then `jj workspace forget <workspace_path>`. ' +
+          'The workspace path is in the card under "## Workspace". '
+      } else {
+        workspaceInstructions = hasWorkspace
+          ? 'Do all code changes inside the workspace recorded in the "## Workspace" section of the card. jj tracks changes automatically, no staging needed. '
+          : 'Create a jj workspace at ' + workspacePath + ' before doing any work ' +
+            '(run: jj workspace add ' + workspacePath + ' --repo ' + repo + '). ' +
+            'Do all code changes inside that workspace. jj tracks changes automatically, no staging needed. ' +
+            'Record the workspace path in the card under a "## Workspace" heading when done. '
+      }
+    }
 
     const prompt =
       'Pick up the oldest card from ' + fromPath + '/. ' +
@@ -240,7 +254,6 @@ function makeSpawnOne(fromColId, transition) {
       'If you cannot proceed without a human decision, move it to ' + path.join(BOARD_DIR, 'blocked') + '/ instead ' +
       'and document the question clearly in the card.'
 
-    const agentType = transition.agent || transition.to
     boardLog(agentType + ' ' + cardSlug + ' started')
 
     const proc = spawn('claude', [
@@ -373,8 +386,7 @@ Do not write any implementation code.
   implement: `You are an implementer. Your only job is to write code that makes the failing tests pass.
 The orchestrator will tell you which card to pick up and where to move it when done.
 
-Read the card fully before writing any code. Do all your work inside the workspace recorded
-in the card under "## Workspace" — jj tracks changes automatically, no staging needed.
+Read the card fully before writing any code.
 The test files are listed under "## Tests" in the card.
 
 Rules:
@@ -385,11 +397,10 @@ Rules:
 - All tests must be green before you move the card on.
 `,
 
-  review: `You are a code reviewer. Your only job is to critique the current diff and merge it if approved.
+  review: `You are a code reviewer. Your only job is to critique the current diff.
 The orchestrator will tell you which card to pick up and where to move it when done.
 
-Read the card before doing anything else. Run \`jj diff\` inside the workspace recorded
-in the card under "## Workspace" to see the changes under review.
+Read the card before doing anything else.
 
 Append your findings to the card under a "## Review" heading:
 
@@ -399,13 +410,7 @@ Append your findings to the card under a "## Review" heading:
 4. Edge cases — inputs or states that could cause unexpected behaviour?
 5. Verdict — APPROVED, APPROVED WITH NOTES, or CHANGES REQUIRED.
 
-If the verdict is APPROVED or APPROVED WITH NOTES:
-- In the main repo, rebase the workspace changes onto the default branch and forget the workspace:
-    jj rebase -d trunk() --branch <workspace_change_id>
-    jj workspace forget <workspace_path>
-- The workspace path is in the card under "## Workspace".
-
-Do not fix anything. Do not write code. Critique only — merging on approval is the sole exception.
+Do not fix anything. Do not write code. Critique only.
 `,
 }
 
