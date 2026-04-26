@@ -877,6 +877,11 @@ const server = http.createServer(async (req, res) => {
       fs.mkdirSync(toDir, { recursive: true })
       fs.renameSync(fromResolved, toResolved)
       boardLog('move ' + boardRelative(fromResolved) + ' ' + boardRelative(toResolved))
+      if (toCol === 'blocked') {
+        const cardName = filename.replace(/\.md$/, '').replace(/[-_]/g, ' ')
+        const proc = spawn('osascript', ['-e', 'display notification "' + cardName + '" with title "Card Blocked"'])
+        proc.on('error', () => {})
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true }))
     } catch { res.writeHead(500); return res.end('Failed') }
   }
