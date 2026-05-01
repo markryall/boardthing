@@ -353,34 +353,37 @@ function watcherStatus() {
 // ── Bootstrap ────────────────────────────────────────────────────────────────
 
 const DEFAULT_COMMANDS = {
-  spec: `You are a spec writer and test designer. Your job is to take a raw card brief,
-produce a precise specification, and write executable failing tests that define done.
+  spec: `You are a spec writer. You maintain the system-wide test specifications for the boardthing codebase.
 The orchestrator will tell you which card to pick up and where to move it when done.
 
-Step 1 — Write the spec. Elaborate the card in-place with this structure:
+The test suite is organised by domain in these files:
+  - startup.test.js     — server startup, config, bootstrap, workspace validation
+  - cards.test.js       — card CRUD, move, delete, and blocked notifications
+  - logging.test.js     — log format and events
+  - agent-pool.test.js  — agent pool management and watcher behaviour
+  - ui.test.js          — HTML rendering, colours, animation, and visual layout
 
-## Goal
-One sentence describing the outcome.
+Step 1 — Understand the change. Read the card brief carefully.
 
-## Acceptance criteria
-A numbered list. Each item must be independently testable. No vague language.
-Every criterion must be falsifiable.
+Step 2 — Read the relevant test file(s) to understand existing coverage and conventions.
 
-## Out of scope
-Explicitly list what this change does NOT do.
+Step 3 — Write failing tests. Add them at the end of the appropriate existing file(s). Each test must:
+  - Fail because the implementation does not yet exist — not due to syntax errors.
+  - Follow the same style and infrastructure as existing tests in that file.
+  - Test observable behaviour, not implementation details.
+  - Use the same port constants and helper functions already defined in the file.
 
-## Open questions
-Anything ambiguous that needs a human decision. If none, write "None".
+If there are blocking open questions that need a human decision, move the card to the blocked
+folder and document the blockers clearly. Do not proceed to adding tests.
 
-If there are blocking open questions, move the card to the blocked folder instead
-and document the blockers clearly. Do not proceed to step 2.
+Step 4 — Update the card. Append a "## Tests" section listing which file(s) were modified
+and a one-line description of each new test. Do not include test code in the card.
 
-Step 2 — Write failing tests. One test per acceptance criterion, named after it.
-Tests must fail because the implementation does not exist yet — not due to syntax errors.
-Prefer integration tests that test behaviour, not implementation details.
-Record the test file path(s) in the card under a "## Tests" heading.
-
-Do not write any implementation code.
+Rules:
+  - Do NOT create new per-feature test files. All tests belong in the domain files above.
+  - Do NOT write any production code — tests only.
+  - If a change touches multiple domains, add tests to each relevant file.
+  - If a change makes an existing test obsolete, remove or update it.
 `,
 
   implement: `You are an implementer. Your only job is to write code that makes the failing tests pass.
@@ -930,9 +933,9 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404); res.end('Not found')
 })
 
-validateConfig()
-
 bootstrap()
+
+validateConfig()
 
 server.listen(PORT, () => {
   console.log('Board viewer → http://localhost:' + PORT)
